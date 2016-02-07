@@ -1,0 +1,362 @@
+#!/usr/bin/env perl
+use Mojolicious::Lite;
+use Data::Dumper;
+
+my $config = plugin 'Config';
+
+get '/' => sub {
+  my $c = shift;
+  $c->render(template => 'index');
+};
+
+
+
+get '/edit/:slug' => sub {
+  my $c = shift;
+  my $slug = $c->param('slug');
+
+  my $md_raw = slurp_md($slug);
+  my $html   = md_to_html ($md_raw); 
+
+  $c->render(template => 'edit', md_raw => $md_raw, html => $html,  'slug' => $slug);
+};
+
+
+post '/edit/:slug' => sub {
+  my $c = shift;
+  my $slug = $c->param('slug');
+#print $c->param('btn');
+  if ($c->param('btn') eq 'Preview') { #preview
+    my $md_raw = $c->param('md_raw');
+    my $html   = md_to_html ($md_raw); 
+
+    $c->render(template => 'edit', md_raw => $md_raw, html => $html, 'slug' => $slug);
+  }; 
+ 
+  if ($c->param('btn') eq 'Save') { #save
+    my $md_raw = $c->param('md_raw');
+    save_md($slug, $md_raw); 
+    $c->flash( flash_ok => "Article saved");
+    $c->redirect_to("/$slug");
+  };
+
+};
+
+
+
+get '/login'  => sub {
+  my $c = shift;
+  $c->redirect_to("/index") if ($c->session->{'user_name'});
+  $c->render(template => 'login');
+};
+
+
+post '/login' => sub  {
+  my $c = shift;
+  my $pwc = $c->param('passcode');
+  my $user_name = $config->{'authors'}->{$pwc};
+  if ($user_name) {
+    $c->session->{'user_name'} = $user_name;
+    $c->flash( flash_ok => "You are logged in, $user_name");
+    $c->redirect_to("/index"); 
+  };
+
+  $c->flash( flash_not_ok => "Unknown passcode");
+  $c->render(template => 'login');
+};
+
+get '/logout' => sub {
+  my $c = shift;
+  my $user_name = $c->session->{'user_name'};
+  undef  $c->session->{'user_name'};
+  $c->flash( flash_ok => "You are now logged out, $user_name");
+  $c->redirect_to("/index");
+};
+
+
+get '/new/:slug' => {slug => ''} , sub {
+  my $c      = shift;
+  my $title  = $c->param('slug');
+  my $slug_   = clean_up_slug($title);
+  my $html = '(click Preview button above to see your edits)';
+  return $c->render(template => 'new', title => $title, slug_ => $slug_);
+};
+
+
+app->validator->add_check(slug_is_valid => sub {
+  my ($validation, $name, $value) = @_;
+  return new_slug_is_valid($value); 
+});
+
+
+
+post '/new' =>  sub {
+  my $c      = shift;
+  my $slug   =  $c->param('slug');
+  my $title  =  $c->param('title');
+  my $validation = $c->validation;
+  return $c->render unless $validation->has_data;
+
+  $validation->required('slug')->size(3, 40)->slug_is_valid();
+  $validation->required('title')->size(3, 128);
+
+  return $c->render('new')  if ($c->validation->has_error || ($c->param('btn') eq 'test_slug'));
+
+  if (($c->param('btn') eq 'create')) { #&& (!$c->validation->has_error)) { 
+
+    my $md_raw = <<"EOT";
+# $title 
+
+## First section goes here
+
+ * a bullet item
+
+## Second section goes here
+
+### a sub-section
+
+// this line is only seen in edit mode, use as notes for author
+
+EOT
+    $c->flash( flash_ok => 'Slug OK, add text below' );
+    $c->render( template => 'edit', title => $title, slug => $slug, 
+      md_raw => $md_raw, html => '' );
+
+  };
+
+
+
+}; #=> 'new';
+
+
+get '/index' => sub {
+  my $c      = shift;
+  my @slugs = @{all_slugs()};     # get filesnames without extension
+  my %firstlines;
+  foreach my $f (@slugs) {
+    open(my $fh, '<:encoding(UTF-8)', "/var/www/html/mdwiki/md/$f.md") 
+      or die "cannot open < $f : $!";
+    my $firstline = <$fh>; #read 1st line
+    if ($firstline && $firstline =~ /^#.*/) { $firstlines{$f} = $firstline };
+    close $fh; 
+  };
+  $c->render(template => 'index',  slugs => \@slugs, firstlines => \%firstlines);
+};
+
+
+get '/:slug' => sub {
+  my $c = shift;
+  my $slug =  $c->param('slug');
+  
+  my $html =  md_to_html(slurp_md($slug));
+  $c->render(template => 'wiki', 'html' => $html, 'slug' => $slug);
+};
+
+
+# ----------
+
+sub new_slug_is_valid {
+  my $slug = shift;
+  my $existing_slugs = all_slugs();
+  my @reserved_words = qw(edit admin new login logout index about readme fuck);
+  push (@$existing_slugs, @reserved_words);
+  map {lc} @$existing_slugs;  
+  my @hits =  (grep {$_ eq lc $slug} @$existing_slugs); 
+#print Dumper @$existing_slugs;
+#print Dumper @;
+  return  scalar @hits;
+}
+
+
+sub clean_up_slug {
+  my $slug = shift;
+  $slug =~ s/[ ]+/_/g;
+  $slug =~ s/[^a-z0-9_-]+//ig; 
+#print  "slug = $slug";
+}
+
+sub all_slugs {
+  opendir my $dir, "./md" or die "Cannot open directory  : $!";
+  my @files = readdir $dir;
+  closedir $dir;
+  @files = grep { !/^\.{1,2}/ } @files;     # remove . and ..
+  @files = grep { /\.md$/ } @files;         # keep .md files only
+  map {$_ =~ s/(.*?)\.md$/$1/ } @files;     # get filesnames without extension
+  return \@files;
+}
+
+
+sub slurp_md {
+  my $file_name = shift;
+  $file_name .=   ".md";
+  open(my $fh, '<:encoding(UTF-8)', "/var/www/html/mdwiki/md/$file_name") 
+		or die "cannot open < $file_name : $!";
+  local $/ = undef;
+  my $md = <$fh>; #slurp content
+  close $fh; 
+  return $md;
+}
+
+
+sub save_md {
+  my $file_name = shift . ".md";
+  my $md = shift;
+  open (my $fh, ">:encoding(UTF-8)", "./md/$file_name") or die "cannot open file for writing $!"; 
+  print $fh $md; 
+  close ($fh);
+}
+
+use Text::Markdown 'markdown';
+sub md_to_html {
+  my $md = shift;
+  my $html =  markdown($md);
+  $html =~ s/>http:\/\//>/g;      #remove http:// from visible site name
+  return $html;
+}
+
+app->start;
+
+__DATA__
+
+@@ index.html.ep
+% layout 'default';
+% title 'Index of Pages';
+
+<h2>Welcome to the Mojolicious real-time web framework!</h2>
+
+% my @slugz =  sort @$slugs;
+<ul>
+% for my $slug (@slugz) {
+  <li> <a href="/<%= $slug %>"><%= $slug %></a> : <%= $$firstlines{$slug} %> </li>
+
+% };
+  <li> Special pages: </li>
+% if (session 'user_name') {
+  <li> <a href="/new">Create New Page</a>
+  <li> <a href="/logout">Logout</a> <%= session ('user_name') %>
+% } else {
+  <li> <a href="/login">Login</a>
+% };
+</ul>
+
+@@ wiki.html.ep
+% layout 'default';
+% title 'wiki';
+<a href="/edit/<%= $slug %>">Edit this page</a>
+<article>
+%== $html
+</article>
+
+
+@@ new.html.ep
+% layout 'default', suppress_footer => 1;
+% title 'new article';
+
+%= form_for '/new' => (method => 'POST') => begin
+<div>
+% if (my $err = validation->error('slug')) {
+        <p>
+          %= 'At least 3 charactes are required.' if $err->[0] eq 'required';
+          %= 'Already in use' if $err->[0] eq 'is_valid_slug';
+        </p>
+% };
+</div> 
+  %= label_for  title => 'Title' 
+  %= text_field 'title', size => "100"
+  %= label_for  slug => 'Slug' 
+  %= text_field 'slug', style => "display: inline-block", pattern => '[a-zA-Z0-9_.]+'
+  %= submit_button 'Test Slug', name => 'btn', value => 'test_slug', caption => 'Test Slug'
+<br/>  
+  %#= submit_button 'Save & Create Page', name => 'btn', value => 'create'
+  <button name='btn' value='create' type="submit">Save & Create Pag</button>
+  <a  style="display: inline-block" href="/index">Cancel</a>
+% end
+
+
+
+@@ edit.html.ep
+% layout 'default', suppress_footer => 1;
+% title 'Edit page';
+%= form_for  "/edit/$slug"   => (method => 'POST') => begin
+%#= form_for '<%= url_for "/edit/$slug" %>'   => (method => 'POST') => begin
+  %#= text_field 'title'
+  %#= text_field 'slug', value => $slug
+  %#= submit_button 'Test Slug', name => 'btn', value => 'test_slug'
+<a href="/<%= $slug %>">Cancel</a> | 
+  <a href="https://rawgit.com/fletcher/human-markdown-reference/master/index.html" target='_blank'>MD cheat sheet</a>
+<button onclick="open_cs(); return false;">Mark Down Cheat Sheet</button>
+<a href="#" onclick="open_cs();return 0">Mark Down Cheat Sheet</a>
+
+<script>
+function open_cs() {
+  var w =  window.open("https://rawgit.com/fletcher/human-markdown-reference/master/index.html", "_blank", "toolbar=no, scrollbars=yes, status=no, menubar=no, location=no, width=480, height=480"); 
+  return w?false:true;
+}
+</script>
+
+  %= text_area 'md_raw' => $md_raw, rows => 40, cols => 96, style => "font-family:Consolas,Monaco,Lucida Console,Liberation Mono,DejaVu Sans Mono,Bitstream Vera Sans Mono,Courier New, monospace;"
+
+  %= submit_button 'Save',    name => 'btn', value => 'Save'
+  %= submit_button 'Preview', name => 'btn', value => 'Preview'
+% end
+<a href="/<%= $slug %>">Cancel</a>
+
+<hr/>
+<article>
+%== $html
+</article>
+
+
+@@ login.html.ep
+% layout 'default';
+% title 'Log In';
+
+<%= session 'user_name' %>
+
+<h2>Login with just the passcode you received</h2>
+%= form_for  "/login"   => (method => 'POST') => begin
+  %= password_field 'passcode'
+  %= submit_button 'Login', name => 'btn', value => 'login'
+%= end
+
+
+
+
+@@ layouts/default.html.ep
+<!DOCTYPE html>
+<head>
+  <link rel="stylesheet" href="/tacit-small.css">
+    <style>
+      label.field-with-error { color: #dd7e5e }
+      input.field-with-error { background-color: #fd9e7e }
+    </style>
+</head>
+<html>
+  <head><title><%= title %></title></head>
+  <body style="font-size:0.8em">
+  % if ( my $message = flash 'flash_ok' ) { 
+    <div  style="border:1px solid #fc0; background: #fec; padding:1em;">
+    <%= b( $message )->decode('UTF-8')->to_string %>
+    </div>
+  % }
+  % if ( my $message = flash 'flash_not_ok' ) { 
+    <div  style="border:1px solid #f00; background: #F7B5B5; padding:1em;">
+    <%= b( $message )->decode('UTF-8')->to_string %>
+    </div>
+  % }
+
+ <div style="font-size:50%">
+  <%= content %></div></body>
+% unless (defined stash('suppress_footer')) {
+<footer>
+  <div  style="border:1px solid #505050; background: #d1d1d1; padding:1em;">
+    [ <a href="/index">Index</a> |  Readme | About 
+ | template: 
+    ] 
+  </div>
+</footer>
+% };
+</html>
+
+@@
+# ex: set tabstop=2 shiftwidth=2 expandtab:
